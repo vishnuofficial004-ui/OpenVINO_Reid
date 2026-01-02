@@ -7,10 +7,11 @@ from openvino.runtime import Core
 # =============================
 # CONFIGURATION
 # =============================
-STABLE_SECONDS = 3
+STABLE_SECONDS = 2
 IOU_THRESHOLD = 0.3
 EMBEDDING_THRESHOLD = 0.68
 MAX_MISSING = 1
+LOST_MAX = 150
 IS_ENTRY_CAMERA = True
 
 EMBEDDING_FILE = "embeddings_store.pkl"
@@ -38,6 +39,9 @@ def load_embedding_store():
 def save_embedding_store(store):
     with open(EMBEDDING_FILE, "wb") as f:
         pickle.dump(store, f)
+
+# ✅ FIX 1: LOAD ONCE
+persistent_store = load_embedding_store()
 
 # =============================
 # MODEL LOADING
@@ -67,6 +71,12 @@ def iou(a, b):
 def cosine(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
+def overlaps_existing_track(box):
+    for t in tracks.values():
+        if iou(box, t["bbox"]) > IOU_THRESHOLD:
+            return True
+    return False
+
 # =============================
 # FACE PIPELINE
 # =============================
@@ -87,34 +97,23 @@ def extract_embedding(face_crop, reid_model):
         reid_model.outputs[0].any_name].flatten()
 
 # =============================
-# ID RESOLUTION (SAFE)
+# TRACK MATCHING
 # =============================
-def resolve_existing_id(emb, box):
-    store = load_embedding_store()
-
-    for tid, t in tracks.items():
+def match_face_to_tracks(box, emb):
+    for t in tracks.values():
         if cosine(emb, t["emb"]) > EMBEDDING_THRESHOLD:
-            return tid
+            t["bbox"], t["emb"], t["miss"], t["src"] = box, emb, 0, "face"
+            embedding_db[t["id"]] = emb
+            return t["id"]
+    return None
 
-    for tid, t in lost_tracks.items():
-        if cosine(emb, t["emb"]) > EMBEDDING_THRESHOLD:
-            tracks[tid] = {
-                "id": tid, "bbox": box, "emb": t["emb"],
-                "miss": 0, "src": "face"
-            }
-            embedding_db[tid] = t["emb"]
+def match_lost_tracks(emb, box):
+    for tid, d in list(lost_tracks.items()):
+        if cosine(emb, d["emb"]) > EMBEDDING_THRESHOLD:
+            tracks[tid] = {"id": tid, "bbox": box, "emb": d["emb"], "miss": 0, "src": "face"}
             del lost_tracks[tid]
+            embedding_db[tid] = d["emb"]
             return tid
-
-    for tid, e in store.items():
-        if cosine(emb, e) > EMBEDDING_THRESHOLD:
-            tracks[tid] = {
-                "id": tid, "bbox": box, "emb": e,
-                "miss": 0, "src": "face"
-            }
-            embedding_db[tid] = e
-            return tid
-
     return None
 
 # =============================
@@ -141,9 +140,16 @@ def promote_stable_face(box, emb, stable_frames):
     emb = potential_tracks[pid]["emb"]
     del potential_tracks[pid]
 
-    store = load_embedding_store()
-    for tid, e in store.items():
+    # ✅ FIX 2: CHECK RUNTIME DB
+    for tid, e in embedding_db.items():
         if cosine(emb, e) > EMBEDDING_THRESHOLD:
+            return tid
+
+    # ✅ FIX 3: CHECK PERSISTENT STORE BEFORE NEW ID
+    for tid, e in persistent_store.items():
+        if cosine(emb, e) > EMBEDDING_THRESHOLD:
+            tracks[tid] = {"id": tid, "bbox": box, "emb": e, "miss": 0, "src": "face"}
+            embedding_db[tid] = e
             return tid
 
     tid = next_track_id
@@ -151,8 +157,8 @@ def promote_stable_face(box, emb, stable_frames):
 
     tracks[tid] = {"id": tid, "bbox": box, "emb": emb, "miss": 0, "src": "face"}
     embedding_db[tid] = emb
-    store[tid] = emb
-    save_embedding_store(store)
+    persistent_store[tid] = emb
+    save_embedding_store(persistent_store)
 
     return tid
 
@@ -170,7 +176,7 @@ def detect_bodies(frame, model):
                           int((d[5]-d[3])*w), int((d[6]-d[4])*h)))
     return boxes
 
-def body_fallback(frame, body_model, active_ids):
+def body_fallback_tracking(frame, body_model, active_ids):
     bodies = detect_bodies(frame, body_model)
     for tid in set(tracks.keys()) - active_ids:
         best, score = None, 0
@@ -179,15 +185,13 @@ def body_fallback(frame, body_model, active_ids):
             if s > score:
                 best, score = b, s
         if best:
-            tracks[tid]["bbox"] = best
-            tracks[tid]["src"] = "body"
-            tracks[tid]["miss"] = 0
+            tracks[tid]["bbox"], tracks[tid]["src"], tracks[tid]["miss"] = best, "body", 0
             active_ids.add(tid)
 
 # =============================
 # MAINTENANCE
 # =============================
-def update_missing(active_ids):
+def update_missing_tracks(active_ids):
     for tid in list(tracks.keys()):
         if tid not in active_ids:
             tracks[tid]["miss"] += 1
@@ -198,12 +202,12 @@ def update_missing(active_ids):
 # =============================
 # VISUALIZATION
 # =============================
-def draw(frame):
+def draw_tracks(frame):
     for t in tracks.values():
         x, y, w, h = t["bbox"]
-        color = (0,255,0) if t["src"] == "face" else (0,0,255)
-        cv2.rectangle(frame, (x,y), (x+w,y+h), color, 2)
-        cv2.putText(frame, f"ID {t['id']}", (x,y-10),
+        color = (0, 255, 0) if t["src"] == "face" else (0, 0, 255)
+        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+        cv2.putText(frame, f"ID {t['id']}", (x, y-10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 # =============================
@@ -214,8 +218,7 @@ def main():
     cap = cv2.VideoCapture(0)
 
     fps = cap.get(cv2.CAP_PROP_FPS)
-    fps = fps if fps > 0 else 10
-    stable_frames = int(fps * STABLE_SECONDS)
+    stable_frames = int((fps if fps > 0 else 10) * STABLE_SECONDS)
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -233,15 +236,17 @@ def main():
             emb = extract_embedding(crop, models["reid"])
             box = (x1, y1, x2-x1, y2-y1)
 
-            tid = resolve_existing_id(emb, box) or \
-                  promote_stable_face(box, emb, stable_frames)
+            tid = match_face_to_tracks(box, emb) or match_lost_tracks(emb, box)
+
+            if tid is None and not overlaps_existing_track(box):
+                tid = promote_stable_face(box, emb, stable_frames)
 
             if tid is not None:
                 active_ids.add(tid)
 
-        body_fallback(frame, models["body_det"], active_ids)
-        update_missing(active_ids)
-        draw(frame)
+        body_fallback_tracking(frame, models["body_det"], active_ids)
+        update_missing_tracks(active_ids)
+        draw_tracks(frame)
 
         cv2.imshow("Tracker", frame)
         if cv2.waitKey(1) & 0xFF == 27:
