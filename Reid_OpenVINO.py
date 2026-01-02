@@ -7,9 +7,9 @@ from openvino.runtime import Core
 # =============================
 # CONFIGURATION
 # =============================
-STABLE_SECONDS = 2
+STABLE_SECONDS = 1.5
 IOU_THRESHOLD = 0.3
-EMBEDDING_THRESHOLD = 0.68
+EMBEDDING_THRESHOLD = 0.80
 MAX_MISSING = 1
 LOST_MAX = 150
 IS_ENTRY_CAMERA = True
@@ -40,7 +40,6 @@ def save_embedding_store(store):
     with open(EMBEDDING_FILE, "wb") as f:
         pickle.dump(store, f)
 
-# ✅ FIX 1: LOAD ONCE
 persistent_store = load_embedding_store()
 
 # =============================
@@ -71,11 +70,11 @@ def iou(a, b):
 def cosine(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def overlaps_existing_track(box):
+def get_overlapping_track(box):
     for t in tracks.values():
         if iou(box, t["bbox"]) > IOU_THRESHOLD:
-            return True
-    return False
+            return t["id"]
+    return None
 
 # =============================
 # FACE PIPELINE
@@ -102,7 +101,10 @@ def extract_embedding(face_crop, reid_model):
 def match_face_to_tracks(box, emb):
     for t in tracks.values():
         if cosine(emb, t["emb"]) > EMBEDDING_THRESHOLD:
-            t["bbox"], t["emb"], t["miss"], t["src"] = box, emb, 0, "face"
+            t["bbox"] = box
+            t["emb"] = emb
+            t["miss"] = 0
+            t["src"] = "face"
             embedding_db[t["id"]] = emb
             return t["id"]
     return None
@@ -110,14 +112,41 @@ def match_face_to_tracks(box, emb):
 def match_lost_tracks(emb, box):
     for tid, d in list(lost_tracks.items()):
         if cosine(emb, d["emb"]) > EMBEDDING_THRESHOLD:
-            tracks[tid] = {"id": tid, "bbox": box, "emb": d["emb"], "miss": 0, "src": "face"}
+            tracks[tid] = {
+                "id": tid,
+                "bbox": box,
+                "emb": d["emb"],
+                "miss": 0,
+                "src": "face"
+            }
             del lost_tracks[tid]
             embedding_db[tid] = d["emb"]
             return tid
     return None
 
 # =============================
-# STABLE ENTRY-ONLY ID ASSIGNMENT
+# STABLE EMBEDDING AGGREGATION
+# =============================
+def aggregate_similar_embeddings(embeddings, sim_threshold=0.75):
+    n = len(embeddings)
+    if n == 1:
+        return embeddings[0]
+
+    # Count similarity for each embedding
+    scores = [0] * n
+    for i in range(n):
+        for j in range(n):
+            if i != j and cosine(embeddings[i], embeddings[j]) > sim_threshold:
+                scores[i] += 1
+
+    max_score = max(scores)
+    stable_embs = [embeddings[i] for i, s in enumerate(scores) if s == max_score]
+
+    # Aggregate by mean
+    return np.mean(stable_embs, axis=0)
+
+# =============================
+# STABLE ENTRY ID ASSIGNMENT
 # =============================
 def promote_stable_face(box, emb, stable_frames):
     global next_track_id, next_temp_id
@@ -125,39 +154,60 @@ def promote_stable_face(box, emb, stable_frames):
     if not IS_ENTRY_CAMERA:
         return None
 
+    # Update potential tracks
     for pid, p in potential_tracks.items():
         if iou(box, p["bbox"]) > IOU_THRESHOLD:
-            p["bbox"], p["emb"], p["frames"] = box, emb, p["frames"] + 1
+            p["bbox"] = box
+            p["embeddings"].append(emb)
+            p["frames"] += 1
             break
     else:
         pid = next_temp_id
         next_temp_id += 1
-        potential_tracks[pid] = {"bbox": box, "emb": emb, "frames": 1}
+        potential_tracks[pid] = {
+            "bbox": box,
+            "embeddings": [emb],
+            "frames": 1
+        }
 
     if potential_tracks[pid]["frames"] < stable_frames:
         return None
 
-    emb = potential_tracks[pid]["emb"]
+    # Aggregate embeddings from stable frames
+    embeddings = potential_tracks[pid]["embeddings"]
+    final_emb = aggregate_similar_embeddings(embeddings, sim_threshold=0.75)
     del potential_tracks[pid]
 
-    # ✅ FIX 2: CHECK RUNTIME DB
+    # Compare with runtime DB
     for tid, e in embedding_db.items():
-        if cosine(emb, e) > EMBEDDING_THRESHOLD:
+        if cosine(final_emb, e) > EMBEDDING_THRESHOLD:
             return tid
 
-    # ✅ FIX 3: CHECK PERSISTENT STORE BEFORE NEW ID
+    # Compare with persistent DB
     for tid, e in persistent_store.items():
-        if cosine(emb, e) > EMBEDDING_THRESHOLD:
-            tracks[tid] = {"id": tid, "bbox": box, "emb": e, "miss": 0, "src": "face"}
+        if cosine(final_emb, e) > EMBEDDING_THRESHOLD:
+            tracks[tid] = {
+                "id": tid,
+                "bbox": box,
+                "emb": e,
+                "miss": 0,
+                "src": "face"
+            }
             embedding_db[tid] = e
             return tid
 
+    # Assign new GID
     tid = next_track_id
     next_track_id += 1
-
-    tracks[tid] = {"id": tid, "bbox": box, "emb": emb, "miss": 0, "src": "face"}
-    embedding_db[tid] = emb
-    persistent_store[tid] = emb
+    tracks[tid] = {
+        "id": tid,
+        "bbox": box,
+        "emb": final_emb,
+        "miss": 0,
+        "src": "face"
+    }
+    embedding_db[tid] = final_emb
+    persistent_store[tid] = final_emb
     save_embedding_store(persistent_store)
 
     return tid
@@ -185,7 +235,9 @@ def body_fallback_tracking(frame, body_model, active_ids):
             if s > score:
                 best, score = b, s
         if best:
-            tracks[tid]["bbox"], tracks[tid]["src"], tracks[tid]["miss"] = best, "body", 0
+            tracks[tid]["bbox"] = best
+            tracks[tid]["src"] = "body"
+            tracks[tid]["miss"] = 0
             active_ids.add(tid)
 
 # =============================
@@ -236,10 +288,20 @@ def main():
             emb = extract_embedding(crop, models["reid"])
             box = (x1, y1, x2-x1, y2-y1)
 
-            tid = match_face_to_tracks(box, emb) or match_lost_tracks(emb, box)
-
-            if tid is None and not overlaps_existing_track(box):
-                tid = promote_stable_face(box, emb, stable_frames)
+            # ===== NEW FEATURE: skip already tracked faces =====
+            tid = get_overlapping_track(box)
+            if tid is not None:
+                # Update existing track
+                tracks[tid]["bbox"] = box
+                tracks[tid]["emb"] = emb
+                tracks[tid]["miss"] = 0
+                tracks[tid]["src"] = "face"
+                embedding_db[tid] = emb
+            else:
+                # Not tracked yet
+                tid = match_face_to_tracks(box, emb) or match_lost_tracks(emb, box)
+                if tid is None:
+                    tid = promote_stable_face(box, emb, stable_frames)
 
             if tid is not None:
                 active_ids.add(tid)
