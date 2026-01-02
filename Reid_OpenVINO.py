@@ -1,87 +1,60 @@
 import cv2
 import numpy as np
-import os
 import pickle
+import os
 from openvino.runtime import Core
 
-# =============================
-# CONFIGURATION
-# =============================
+# ================= CONFIG =================
 STABLE_SECONDS = 1.5
 IOU_THRESHOLD = 0.3
-EMBEDDING_THRESHOLD = 0.80
-MAX_MISSING = 1
-LOST_MAX = 150
-IS_ENTRY_CAMERA = True
+ENTRY_THRESHOLD = 0.80
+SECONDARY_THRESHOLD = 0.72
+MAX_MISSING = 5
 
+MOBILE_STREAM = "http://192.168.1.5:8080/video"  # CHANGE IP
+PC_CAM_INDEX = 0
 EMBEDDING_FILE = "embeddings_store.pkl"
 
-# =============================
-# GLOBAL STATE
-# =============================
-tracks = {}
-lost_tracks = {}
-potential_tracks = {}
-embedding_db = {}
-
-next_track_id = 0
-next_temp_id = 0
-
-# =============================
-# PERSISTENT STORAGE
-# =============================
-def load_embedding_store():
+# ================= STORAGE =================
+def load_store():
     if os.path.exists(EMBEDDING_FILE):
         with open(EMBEDDING_FILE, "rb") as f:
             return pickle.load(f)
     return {}
 
-def save_embedding_store(store):
+def save_store(store):
     with open(EMBEDDING_FILE, "wb") as f:
         pickle.dump(store, f)
 
-persistent_store = load_embedding_store()
+persistent_store = load_store()
+next_gid = max(persistent_store.keys(), default=-1) + 1
 
-# =============================
-# MODEL LOADING
-# =============================
+# ================= MODELS =================
 def load_models():
     ie = Core()
     return {
-        "face_det": ie.compile_model(
+        "face": ie.compile_model(
             "models/face-detection-retail-0004/face-detection-retail-0004.xml", "CPU"),
-        "body_det": ie.compile_model(
-            "models/person-detection-retail-0013/person-detection-retail-0013.xml", "CPU"),
         "reid": ie.compile_model(
-            "models/face-reidentification-retail-0095/face-reidentification-retail-0095.xml", "CPU"),
+            "models/face-reidentification-retail-0095/face-reidentification-retail-0095.xml", "CPU")
     }
 
-# =============================
-# UTILITIES
-# =============================
-def iou(a, b):
-    xA = max(a[0], b[0])
-    yA = max(a[1], b[1])
-    xB = min(a[0] + a[2], b[0] + b[2])
-    yB = min(a[1] + a[3], b[1] + b[3])
-    inter = max(0, xB - xA) * max(0, yB - yA)
-    return inter / (a[2]*a[3] + b[2]*b[3] - inter + 1e-6)
-
+# ================= UTILS =================
 def cosine(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def get_overlapping_track(box):
-    for t in tracks.values():
-        if iou(box, t["bbox"]) > IOU_THRESHOLD:
-            return t["id"]
-    return None
+def iou(a, b):
+    xA = max(a[0], b[0])
+    yA = max(a[1], b[1])
+    xB = min(a[0]+a[2], b[0]+b[2])
+    yB = min(a[1]+a[3], b[1]+b[3])
+    inter = max(0, xB-xA) * max(0, yB-yA)
+    return inter / (a[2]*a[3] + b[2]*b[3] - inter + 1e-6)
 
-# =============================
-# FACE PIPELINE
-# =============================
+# ================= PIPELINE =================
 def detect_faces(frame, model):
     h, w = frame.shape[:2]
-    blob = cv2.resize(frame, (300, 300)).transpose(2, 0, 1)[None].astype(np.float32)
+    blob = cv2.resize(frame, (300,300)).transpose(2,0,1)[None].astype(np.float32)
     out = model({model.inputs[0].any_name: blob})[model.outputs[0].any_name]
     faces = []
     for d in out[0][0]:
@@ -90,232 +63,136 @@ def detect_faces(frame, model):
                           int(d[5]*w), int(d[6]*h)))
     return faces
 
-def extract_embedding(face_crop, reid_model):
-    blob = cv2.resize(face_crop, (128, 128)).transpose(2, 0, 1)[None].astype(np.float32)
-    return reid_model({reid_model.inputs[0].any_name: blob})[
-        reid_model.outputs[0].any_name].flatten()
+def extract_embedding(crop, model):
+    blob = cv2.resize(crop, (128,128)).transpose(2,0,1)[None].astype(np.float32)
+    return model({model.inputs[0].any_name: blob})[
+        model.outputs[0].any_name].flatten()
 
-# =============================
-# TRACK MATCHING
-# =============================
-def match_face_to_tracks(box, emb):
-    for t in tracks.values():
-        if cosine(emb, t["emb"]) > EMBEDDING_THRESHOLD:
-            t["bbox"] = box
-            t["emb"] = emb
-            t["miss"] = 0
-            t["src"] = "face"
-            embedding_db[t["id"]] = emb
-            return t["id"]
-    return None
+def aggregate_embeddings(embs):
+    sims = np.array([[cosine(a,b) for b in embs] for a in embs])
+    best = np.argmax(sims.sum(axis=1))
+    good = [embs[i] for i in range(len(embs)) if sims[best][i] > 0.9]
+    emb = np.mean(good, axis=0)
+    return emb / np.linalg.norm(emb)
 
-def match_lost_tracks(emb, box):
-    for tid, d in list(lost_tracks.items()):
-        if cosine(emb, d["emb"]) > EMBEDDING_THRESHOLD:
-            tracks[tid] = {
-                "id": tid,
-                "bbox": box,
-                "emb": d["emb"],
-                "miss": 0,
-                "src": "face"
-            }
-            del lost_tracks[tid]
-            embedding_db[tid] = d["emb"]
-            return tid
-    return None
+# ================= CAMERA PROCESS =================
+def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
+    global next_gid
 
-# =============================
-# STABLE EMBEDDING AGGREGATION
-# =============================
-def aggregate_similar_embeddings(embeddings, sim_threshold=0.75):
-    n = len(embeddings)
-    if n == 1:
-        return embeddings[0]
+    active = set()
+    faces = detect_faces(frame, models["face"])
 
-    # Count similarity for each embedding
-    scores = [0] * n
-    for i in range(n):
-        for j in range(n):
-            if i != j and cosine(embeddings[i], embeddings[j]) > sim_threshold:
-                scores[i] += 1
+    for (x1,y1,x2,y2) in faces:
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
 
-    max_score = max(scores)
-    stable_embs = [embeddings[i] for i, s in enumerate(scores) if s == max_score]
+        emb = extract_embedding(crop, models["reid"])
+        box = (x1,y1,x2-x1,y2-y1)
 
-    # Aggregate by mean
-    return np.mean(stable_embs, axis=0)
+        # Already tracked?
+        matched = False
+        for tid, t in tracks.items():
+            if iou(box, t["bbox"]) > IOU_THRESHOLD:
+                t["bbox"] = box
+                t["miss"] = 0
+                active.add(tid)
+                matched = True
+                break
 
-# =============================
-# STABLE ENTRY ID ASSIGNMENT
-# =============================
-def promote_stable_face(box, emb, stable_frames):
-    global next_track_id, next_temp_id
+        if matched:
+            continue
 
-    if not IS_ENTRY_CAMERA:
-        return None
+        # ENTRY camera
+        if is_entry:
+            pid = None
+            for k, p in potentials.items():
+                if iou(box, p["bbox"]) > IOU_THRESHOLD:
+                    pid = k
+                    break
 
-    # Update potential tracks
-    for pid, p in potential_tracks.items():
-        if iou(box, p["bbox"]) > IOU_THRESHOLD:
-            p["bbox"] = box
-            p["embeddings"].append(emb)
-            p["frames"] += 1
-            break
-    else:
-        pid = next_temp_id
-        next_temp_id += 1
-        potential_tracks[pid] = {
-            "bbox": box,
-            "embeddings": [emb],
-            "frames": 1
-        }
-
-    if potential_tracks[pid]["frames"] < stable_frames:
-        return None
-
-    # Aggregate embeddings from stable frames
-    embeddings = potential_tracks[pid]["embeddings"]
-    final_emb = aggregate_similar_embeddings(embeddings, sim_threshold=0.75)
-    del potential_tracks[pid]
-
-    # Compare with runtime DB
-    for tid, e in embedding_db.items():
-        if cosine(final_emb, e) > EMBEDDING_THRESHOLD:
-            return tid
-
-    # Compare with persistent DB
-    for tid, e in persistent_store.items():
-        if cosine(final_emb, e) > EMBEDDING_THRESHOLD:
-            tracks[tid] = {
-                "id": tid,
-                "bbox": box,
-                "emb": e,
-                "miss": 0,
-                "src": "face"
-            }
-            embedding_db[tid] = e
-            return tid
-
-    # Assign new GID
-    tid = next_track_id
-    next_track_id += 1
-    tracks[tid] = {
-        "id": tid,
-        "bbox": box,
-        "emb": final_emb,
-        "miss": 0,
-        "src": "face"
-    }
-    embedding_db[tid] = final_emb
-    persistent_store[tid] = final_emb
-    save_embedding_store(persistent_store)
-
-    return tid
-
-# =============================
-# BODY FALLBACK
-# =============================
-def detect_bodies(frame, model):
-    h, w = frame.shape[:2]
-    blob = cv2.resize(frame, (544, 320)).transpose(2, 0, 1)[None].astype(np.float32)
-    out = model({model.inputs[0].any_name: blob})[model.outputs[0].any_name]
-    boxes = []
-    for d in out[0][0]:
-        if d[2] > 0.5:
-            boxes.append((int(d[3]*w), int(d[4]*h),
-                          int((d[5]-d[3])*w), int((d[6]-d[4])*h)))
-    return boxes
-
-def body_fallback_tracking(frame, body_model, active_ids):
-    bodies = detect_bodies(frame, body_model)
-    for tid in set(tracks.keys()) - active_ids:
-        best, score = None, 0
-        for b in bodies:
-            s = iou(b, tracks[tid]["bbox"])
-            if s > score:
-                best, score = b, s
-        if best:
-            tracks[tid]["bbox"] = best
-            tracks[tid]["src"] = "body"
-            tracks[tid]["miss"] = 0
-            active_ids.add(tid)
-
-# =============================
-# MAINTENANCE
-# =============================
-def update_missing_tracks(active_ids):
-    for tid in list(tracks.keys()):
-        if tid not in active_ids:
-            tracks[tid]["miss"] += 1
-            if tracks[tid]["miss"] > MAX_MISSING:
-                lost_tracks[tid] = tracks[tid]
-                del tracks[tid]
-
-# =============================
-# VISUALIZATION
-# =============================
-def draw_tracks(frame):
-    for t in tracks.values():
-        x, y, w, h = t["bbox"]
-        color = (0, 255, 0) if t["src"] == "face" else (0, 0, 255)
-        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-        cv2.putText(frame, f"ID {t['id']}", (x, y-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-# =============================
-# MAIN LOOP
-# =============================
-def main():
-    models = load_models()
-    cap = cv2.VideoCapture(0)
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    stable_frames = int((fps if fps > 0 else 10) * STABLE_SECONDS)
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        active_ids = set()
-        faces = detect_faces(frame, models["face_det"])
-
-        for x1, y1, x2, y2 in faces:
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
+            if pid is None:
+                pid = len(potentials)
+                potentials[pid] = {"bbox": box, "embs": [emb], "frames": 1}
                 continue
 
-            emb = extract_embedding(crop, models["reid"])
-            box = (x1, y1, x2-x1, y2-y1)
+            p = potentials[pid]
+            p["frames"] += 1
+            p["embs"].append(emb)
+            p["bbox"] = box
 
-            # ===== NEW FEATURE: skip already tracked faces =====
-            tid = get_overlapping_track(box)
-            if tid is not None:
-                # Update existing track
-                tracks[tid]["bbox"] = box
-                tracks[tid]["emb"] = emb
-                tracks[tid]["miss"] = 0
-                tracks[tid]["src"] = "face"
-                embedding_db[tid] = emb
-            else:
-                # Not tracked yet
-                tid = match_face_to_tracks(box, emb) or match_lost_tracks(emb, box)
-                if tid is None:
-                    tid = promote_stable_face(box, emb, stable_frames)
+            if p["frames"] >= stable_frames:
+                final_emb = aggregate_embeddings(p["embs"])
+                del potentials[pid]
 
-            if tid is not None:
-                active_ids.add(tid)
+                for gid, e in persistent_store.items():
+                    if cosine(final_emb, e) > ENTRY_THRESHOLD:
+                        tracks[gid] = {"bbox": box, "miss": 0}
+                        active.add(gid)
+                        break
+                else:
+                    gid = next_gid
+                    next_gid += 1
+                    persistent_store[gid] = final_emb
+                    save_store(persistent_store)
+                    tracks[gid] = {"bbox": box, "miss": 0}
+                    active.add(gid)
 
-        body_fallback_tracking(frame, models["body_det"], active_ids)
-        update_missing_tracks(active_ids)
-        draw_tracks(frame)
+        # SECONDARY camera
+        else:
+            for gid, e in persistent_store.items():
+                if cosine(emb, e) > SECONDARY_THRESHOLD:
+                    tracks[gid] = {"bbox": box, "miss": 0}
+                    active.add(gid)
+                    break
 
-        cv2.imshow("Tracker", frame)
+    for tid in list(tracks.keys()):
+        if tid not in active:
+            tracks[tid]["miss"] += 1
+            if tracks[tid]["miss"] > MAX_MISSING:
+                del tracks[tid]
+
+# ================= MAIN =================
+def main():
+    models = load_models()
+    cap_m = cv2.VideoCapture(MOBILE_STREAM)
+    cap_p = cv2.VideoCapture(PC_CAM_INDEX)
+
+    tracks_m, tracks_p = {}, {}
+    potentials = {}
+
+    fps = cap_m.get(cv2.CAP_PROP_FPS)
+    stable_frames = int((fps if fps > 0 else 10) * STABLE_SECONDS)
+
+    while True:
+        rm, fm = cap_m.read()
+        rp, fp = cap_p.read()
+
+        if rm:
+            process_camera(fm, tracks_m, potentials, models, True, stable_frames)
+            for gid, t in tracks_m.items():
+                x,y,w,h = t["bbox"]
+                cv2.rectangle(fm,(x,y),(x+w,y+h),(0,255,0),2)
+                cv2.putText(fm,f"ID {gid}",(x,y-10),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
+            cv2.imshow("MOBILE (ENTRY)", fm)
+
+        if rp:
+            process_camera(fp, tracks_p, {}, models, False, stable_frames)
+            for gid, t in tracks_p.items():
+                x,y,w,h = t["bbox"]
+                cv2.rectangle(fp,(x,y),(x+w,y+h),(255,0,0),2)
+                cv2.putText(fp,f"ID {gid}",(x,y-10),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,0,0),2)
+            cv2.imshow("PC (SECONDARY)", fp)
+
         if cv2.waitKey(1) & 0xFF == 27:
             break
 
-    cap.release()
+    cap_m.release()
+    cap_p.release()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
+
