@@ -106,10 +106,10 @@ SECONDARY_CAMERAS = {
     "SEC_1": 1
 }
 
-8. Running the Application
+### 8. Running the Application
 python main.py
 
-9. Visual Output
+### 9. Visual Output
   Bounding Boxes
   Thin rectangles
   Red for primary camera
@@ -125,7 +125,7 @@ YYYY-MM-DD
 
 Timestamp is synchronized across all cameras.
 
-10. ID Assignment Logic
+### 10. ID Assignment Logic
 
    Global IDs are created only in the primary camera
    Secondary cameras only match existing IDs
