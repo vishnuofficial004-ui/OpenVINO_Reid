@@ -77,6 +77,44 @@ def log_event(event_type, gid, camera_name, extra=None):
         "extra": extra or {},
     })
 
+# ================= CONTINUITY METRIC (NEW) =================
+def compute_continuity(log):
+    """
+    Computes identity continuity %: of all times an identity was lost,
+    what fraction were successfully reconnected (a later "matched"
+    event with reentry=True) rather than permanently lost.
+
+    Returns a dict: {
+        "total_losses": int,
+        "reconnected": int,
+        "continuity_pct": float
+    }
+    """
+    lost_events = [e for e in log if e["event"] == "lost"]
+    matched_events = [e for e in log if e["event"] == "matched"]
+
+    reconnected = 0
+    for lost in lost_events:
+        # was there a later "matched" event for the same identity,
+        # marked as a reentry, after this loss?
+        found = any(
+            m["gid"] == lost["gid"]
+            and m["timestamp"] > lost["timestamp"]
+            and m["extra"].get("reentry") is True
+            for m in matched_events
+        )
+        if found:
+            reconnected += 1
+
+    total = len(lost_events)
+    pct = (reconnected / total * 100) if total > 0 else 0.0
+
+    return {
+        "total_losses": total,
+        "reconnected": reconnected,
+        "continuity_pct": round(pct, 2),
+    }
+
 # ================= MODELS =================
 def load_models():
     ie = Core()
@@ -318,6 +356,11 @@ def main():
     for w in workers:
         w.release()
     cv2.destroyAllWindows()
+
+    # NEW: report identity continuity from the session's event log
+    stats = compute_continuity(event_log)
+    print(f"Identity continuity: {stats['reconnected']}/{stats['total_losses']} "
+          f"reconnected ({stats['continuity_pct']}%)")
 
 if __name__ == "__main__":
     main()
