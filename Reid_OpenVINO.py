@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import pickle
 import os
+import time
 from openvino.runtime import Core
 
 # ================= CONFIG =================
@@ -138,6 +139,7 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
             if iou(box, t["bbox"]) > IOU_THRESHOLD:
                 t["bbox"] = box
                 t["miss"] = 0
+                t["last_seen"] = time.time()  # NEW
                 active.add(tid)
                 matched = True
                 break
@@ -172,14 +174,14 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
                 if gid is not None:
                     update_gallery(persistent_store, gid, final_emb)
                     save_store(persistent_store)
-                    tracks[gid] = {"bbox": box, "miss": 0}
+                    tracks[gid] = {"bbox": box, "miss": 0, "last_seen": time.time()}  # NEW
                     active.add(gid)
                 else:
                     gid = next_gid
                     next_gid += 1
                     persistent_store[gid] = [final_emb]  # gallery starts with 1 entry
                     save_store(persistent_store)
-                    tracks[gid] = {"bbox": box, "miss": 0}
+                    tracks[gid] = {"bbox": box, "miss": 0, "last_seen": time.time()}  # NEW
                     active.add(gid)
 
         else:
@@ -187,7 +189,7 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
             gid, _ = best_gallery_match(emb, persistent_store, SECONDARY_THRESHOLD)
             if gid is not None:
                 update_gallery(persistent_store, gid, emb)
-                tracks[gid] = {"bbox": box, "miss": 0}
+                tracks[gid] = {"bbox": box, "miss": 0, "last_seen": time.time()}  # NEW
                 active.add(gid)
 
     for tid in list(tracks.keys()):
