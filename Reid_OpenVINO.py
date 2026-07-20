@@ -13,6 +13,14 @@ MAX_MISSING = 5
 
 EMBEDDING_FILE = "embeddings_store.pkl"
 
+# ---- NEW: gallery settings ----
+# Instead of storing ONE averaged embedding per identity, we keep a small
+# rolling set of embeddings ("gallery") captured at different times/angles.
+# Matching checks similarity against the whole gallery, not one vector,
+# which is far more robust over long sessions.
+GALLERY_SIZE = 5          # max embeddings kept per identity
+GALLERY_ADD_THRESHOLD = 0.85  # only add a new embedding if it's "different enough"
+
 # ---- NEW: list of cameras instead of 2 hardcoded ones ----
 # Each camera config declares its own source and whether it acts
 # as an "entry" camera (i.e. allowed to REGISTER new identities)
@@ -84,6 +92,32 @@ def aggregate_embeddings(embs):
     emb = np.mean(good, axis=0)
     return emb / np.linalg.norm(emb)
 
+# ================= GALLERY MATCHING (NEW) =================
+def best_gallery_match(emb, store, threshold):
+    """
+    Compare emb against every identity's gallery (list of embeddings)
+    and return (gid, score) for the best match above threshold, else
+    (None, 0). This replaces comparing against a single stored vector.
+    """
+    best_gid, best_score = None, 0.0
+    for gid, gallery in store.items():
+        score = max(cosine(emb, g) for g in gallery)
+        if score > threshold and score > best_score:
+            best_gid, best_score = gid, score
+    return best_gid, best_score
+
+def update_gallery(store, gid, emb):
+    """
+    Add emb to gid's gallery if it's sufficiently different from what's
+    already stored (avoids saving near-duplicate frames), and cap the
+    gallery at GALLERY_SIZE by dropping the oldest entry.
+    """
+    gallery = store[gid]
+    if max(cosine(emb, g) for g in gallery) < GALLERY_ADD_THRESHOLD:
+        gallery.append(emb)
+        if len(gallery) > GALLERY_SIZE:
+            gallery.pop(0)
+
 # ================= CAMERA PROCESS =================
 def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
     global next_gid
@@ -132,25 +166,29 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
                 final_emb = aggregate_embeddings(p["embs"])
                 del potentials[pid]
 
-                for gid, e in persistent_store.items():
-                    if cosine(final_emb, e) > ENTRY_THRESHOLD:
-                        tracks[gid] = {"bbox": box, "miss": 0}
-                        active.add(gid)
-                        break
+                # NEW: match against each identity's gallery, not one vector
+                gid, _ = best_gallery_match(final_emb, persistent_store, ENTRY_THRESHOLD)
+
+                if gid is not None:
+                    update_gallery(persistent_store, gid, final_emb)
+                    save_store(persistent_store)
+                    tracks[gid] = {"bbox": box, "miss": 0}
+                    active.add(gid)
                 else:
                     gid = next_gid
                     next_gid += 1
-                    persistent_store[gid] = final_emb
+                    persistent_store[gid] = [final_emb]  # gallery starts with 1 entry
                     save_store(persistent_store)
                     tracks[gid] = {"bbox": box, "miss": 0}
                     active.add(gid)
 
         else:
-            for gid, e in persistent_store.items():
-                if cosine(emb, e) > SECONDARY_THRESHOLD:
-                    tracks[gid] = {"bbox": box, "miss": 0}
-                    active.add(gid)
-                    break
+            # NEW: match against gallery instead of single stored vector
+            gid, _ = best_gallery_match(emb, persistent_store, SECONDARY_THRESHOLD)
+            if gid is not None:
+                update_gallery(persistent_store, gid, emb)
+                tracks[gid] = {"bbox": box, "miss": 0}
+                active.add(gid)
 
     for tid in list(tracks.keys()):
         if tid not in active:
