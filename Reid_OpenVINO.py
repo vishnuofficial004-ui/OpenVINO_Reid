@@ -218,6 +218,7 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames, r
                     reentry = check_reentry(recently_lost, gid)  # NEW
                     tracks[gid] = {"bbox": box, "last_seen": time.time(), "reentry": reentry}
                     active.add(gid)
+                    log_event("matched", gid, camera_name, {"reentry": reentry})  # NEW
                 else:
                     gid = next_gid
                     next_gid += 1
@@ -235,6 +236,7 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames, r
                 reentry = check_reentry(recently_lost, gid)  # NEW
                 tracks[gid] = {"bbox": box, "last_seen": time.time(), "reentry": reentry}
                 active.add(gid)
+                log_event("matched", gid, camera_name, {"reentry": reentry})  # NEW
 
     # CHANGED: expire tracks based on elapsed time since last_seen,
     # not a frame-count "miss" counter. This behaves consistently
