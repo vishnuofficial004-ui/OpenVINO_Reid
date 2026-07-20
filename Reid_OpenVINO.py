@@ -246,6 +246,7 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames, r
         if tid not in active:
             if now - tracks[tid]["last_seen"] > MAX_MISSING_SECONDS:
                 recently_lost[tid] = now  # NEW: remember when this identity was lost
+                log_event("lost", tid, camera_name)  # NEW
                 del tracks[tid]
 
     # NEW: prune recently_lost entries older than the re-entry window,
