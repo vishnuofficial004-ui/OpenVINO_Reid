@@ -162,7 +162,7 @@ def check_reentry(recently_lost, gid):
     return (time.time() - lost_at) <= REENTRY_WINDOW_SECONDS
 
 # ================= CAMERA PROCESS =================
-def process_camera(frame, tracks, potentials, models, is_entry, stable_frames, recently_lost):
+def process_camera(frame, tracks, potentials, models, is_entry, stable_frames, recently_lost, camera_name):
     global next_gid
 
     active = set()
@@ -225,6 +225,7 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames, r
                     save_store(persistent_store)
                     tracks[gid] = {"bbox": box, "last_seen": time.time(), "reentry": False}
                     active.add(gid)
+                    log_event("registered", gid, camera_name)  # NEW
 
         else:
             # NEW: match against gallery instead of single stored vector
@@ -277,7 +278,7 @@ class CameraWorker:
             frame, self.tracks,
             self.potentials if self.is_entry else {},
             models, self.is_entry, self.stable_frames,
-            self.recently_lost  # NEW
+            self.recently_lost, self.name  # NEW: pass camera_name
         )
         for gid, t in self.tracks.items():
             x, y, w, h = t["bbox"]
