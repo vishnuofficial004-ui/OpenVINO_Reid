@@ -10,7 +10,7 @@ STABLE_SECONDS = 1.5
 IOU_THRESHOLD = 0.3
 ENTRY_THRESHOLD = 0.80
 SECONDARY_THRESHOLD = 0.72
-MAX_MISSING = 5
+MAX_MISSING_SECONDS = 3.0  # CHANGED: was MAX_MISSING = 5 (frame count)
 
 EMBEDDING_FILE = "embeddings_store.pkl"
 
@@ -138,8 +138,7 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
         for tid, t in tracks.items():
             if iou(box, t["bbox"]) > IOU_THRESHOLD:
                 t["bbox"] = box
-                t["miss"] = 0
-                t["last_seen"] = time.time()  # NEW
+                t["last_seen"] = time.time()
                 active.add(tid)
                 matched = True
                 break
@@ -174,14 +173,14 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
                 if gid is not None:
                     update_gallery(persistent_store, gid, final_emb)
                     save_store(persistent_store)
-                    tracks[gid] = {"bbox": box, "miss": 0, "last_seen": time.time()}  # NEW
+                    tracks[gid] = {"bbox": box, "last_seen": time.time()}
                     active.add(gid)
                 else:
                     gid = next_gid
                     next_gid += 1
                     persistent_store[gid] = [final_emb]  # gallery starts with 1 entry
                     save_store(persistent_store)
-                    tracks[gid] = {"bbox": box, "miss": 0, "last_seen": time.time()}  # NEW
+                    tracks[gid] = {"bbox": box, "last_seen": time.time()}
                     active.add(gid)
 
         else:
@@ -189,13 +188,16 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
             gid, _ = best_gallery_match(emb, persistent_store, SECONDARY_THRESHOLD)
             if gid is not None:
                 update_gallery(persistent_store, gid, emb)
-                tracks[gid] = {"bbox": box, "miss": 0, "last_seen": time.time()}  # NEW
+                tracks[gid] = {"bbox": box, "last_seen": time.time()}
                 active.add(gid)
 
+    # CHANGED: expire tracks based on elapsed time since last_seen,
+    # not a frame-count "miss" counter. This behaves consistently
+    # regardless of each camera's FPS.
+    now = time.time()
     for tid in list(tracks.keys()):
         if tid not in active:
-            tracks[tid]["miss"] += 1
-            if tracks[tid]["miss"] > MAX_MISSING:
+            if now - tracks[tid]["last_seen"] > MAX_MISSING_SECONDS:
                 del tracks[tid]
 
 # ================= CAMERA WORKER (NEW) =================
