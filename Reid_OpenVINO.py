@@ -11,9 +11,18 @@ ENTRY_THRESHOLD = 0.80
 SECONDARY_THRESHOLD = 0.72
 MAX_MISSING = 5
 
-MOBILE_STREAM = "http://192.168.1.5:8080/video"  # CHANGE IP
-PC_CAM_INDEX = 0
 EMBEDDING_FILE = "embeddings_store.pkl"
+
+# ---- NEW: list of cameras instead of 2 hardcoded ones ----
+# Each camera config declares its own source and whether it acts
+# as an "entry" camera (i.e. allowed to REGISTER new identities)
+# or a "secondary" camera (can only MATCH against existing ones).
+CAMERAS = [
+    {"name": "MOBILE_ENTRY", "source": "http://192.168.1.5:8080/video", "is_entry": True},
+    {"name": "PC_SECONDARY",  "source": 0,                               "is_entry": False},
+    # Add more cameras here, e.g.:
+    # {"name": "HALLWAY_CAM", "source": "rtsp://192.168.1.20/stream", "is_entry": False},
+]
 
 # ================= STORAGE =================
 def load_store():
@@ -90,7 +99,6 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
         emb = extract_embedding(crop, models["reid"])
         box = (x1,y1,x2-x1,y2-y1)
 
-        # Already tracked?
         matched = False
         for tid, t in tracks.items():
             if iou(box, t["bbox"]) > IOU_THRESHOLD:
@@ -103,7 +111,6 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
         if matched:
             continue
 
-        # ENTRY camera
         if is_entry:
             pid = None
             for k, p in potentials.items():
@@ -138,7 +145,6 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
                     tracks[gid] = {"bbox": box, "miss": 0}
                     active.add(gid)
 
-        # SECONDARY camera
         else:
             for gid, e in persistent_store.items():
                 if cosine(emb, e) > SECONDARY_THRESHOLD:
@@ -152,47 +158,66 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
             if tracks[tid]["miss"] > MAX_MISSING:
                 del tracks[tid]
 
+# ================= CAMERA WORKER (NEW) =================
+class CameraWorker:
+    """
+    NEW: wraps a single camera's capture handle, its own tracks dict,
+    and (if it's an entry camera) its own potentials dict.
+    Lets main() loop over an arbitrary list of cameras instead of
+    hardcoding two separate blocks of near-duplicate code.
+    """
+    def __init__(self, config, stable_frames):
+        self.name = config["name"]
+        self.is_entry = config["is_entry"]
+        self.cap = cv2.VideoCapture(config["source"])
+        self.tracks = {}
+        self.potentials = {} if self.is_entry else None
+        self.stable_frames = stable_frames
+
+    def step(self, models):
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+        process_camera(
+            frame, self.tracks,
+            self.potentials if self.is_entry else {},
+            models, self.is_entry, self.stable_frames
+        )
+        for gid, t in self.tracks.items():
+            x, y, w, h = t["bbox"]
+            color = (0, 255, 0) if self.is_entry else (255, 0, 0)
+            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+            cv2.putText(frame, f"ID {gid}", (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        return frame
+
+    def release(self):
+        self.cap.release()
+
 # ================= MAIN =================
 def main():
     models = load_models()
-    cap_m = cv2.VideoCapture(MOBILE_STREAM)
-    cap_p = cv2.VideoCapture(PC_CAM_INDEX)
 
-    tracks_m, tracks_p = {}, {}
-    potentials = {}
-
-    fps = cap_m.get(cv2.CAP_PROP_FPS)
+    # NEW: build a worker per camera in CAMERAS instead of two fixed captures
+    probe_fps_cap = cv2.VideoCapture(CAMERAS[0]["source"])
+    fps = probe_fps_cap.get(cv2.CAP_PROP_FPS)
+    probe_fps_cap.release()
     stable_frames = int((fps if fps > 0 else 10) * STABLE_SECONDS)
 
+    workers = [CameraWorker(cfg, stable_frames) for cfg in CAMERAS]
+
     while True:
-        rm, fm = cap_m.read()
-        rp, fp = cap_p.read()
-
-        if rm:
-            process_camera(fm, tracks_m, potentials, models, True, stable_frames)
-            for gid, t in tracks_m.items():
-                x,y,w,h = t["bbox"]
-                cv2.rectangle(fm,(x,y),(x+w,y+h),(0,255,0),2)
-                cv2.putText(fm,f"ID {gid}",(x,y-10),
-                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
-            cv2.imshow("MOBILE (ENTRY)", fm)
-
-        if rp:
-            process_camera(fp, tracks_p, {}, models, False, stable_frames)
-            for gid, t in tracks_p.items():
-                x,y,w,h = t["bbox"]
-                cv2.rectangle(fp,(x,y),(x+w,y+h),(255,0,0),2)
-                cv2.putText(fp,f"ID {gid}",(x,y-10),
-                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,0,0),2)
-            cv2.imshow("PC (SECONDARY)", fp)
+        for w in workers:
+            frame = w.step(models)
+            if frame is not None:
+                cv2.imshow(w.name, frame)
 
         if cv2.waitKey(1) & 0xFF == 27:
             break
 
-    cap_m.release()
-    cap_p.release()
+    for w in workers:
+        w.release()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
-
