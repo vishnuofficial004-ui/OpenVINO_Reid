@@ -54,6 +54,29 @@ def save_store(store):
 persistent_store = load_store()
 next_gid = max(persistent_store.keys(), default=-1) + 1
 
+# ---- NEW: event log ----
+# Central record of everything that happens to an identity across
+# cameras. Not written to yet — Step 4b/4c/4d will call log_event()
+# for registration, match, and loss events respectively. This log is
+# what Step 4e will use to compute an actual continuity percentage.
+event_log = []
+
+def log_event(event_type, gid, camera_name, extra=None):
+    """
+    Append a single event to the event log.
+    event_type: e.g. "registered", "matched", "lost"
+    gid: identity id involved
+    camera_name: which camera this happened on
+    extra: optional dict of additional info (e.g. {"reentry": True})
+    """
+    event_log.append({
+        "timestamp": time.time(),
+        "event": event_type,
+        "gid": gid,
+        "camera": camera_name,
+        "extra": extra or {},
+    })
+
 # ================= MODELS =================
 def load_models():
     ie = Core()
