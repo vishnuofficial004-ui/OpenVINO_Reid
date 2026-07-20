@@ -12,6 +12,13 @@ ENTRY_THRESHOLD = 0.80
 SECONDARY_THRESHOLD = 0.72
 MAX_MISSING_SECONDS = 3.0  # CHANGED: was MAX_MISSING = 5 (frame count)
 
+# ---- NEW: re-entry window ----
+# When a track expires, we don't just forget it — we remember it was
+# "recently lost" for a short window. If the same identity is matched
+# again within that window, it's a continuous re-entry (e.g. walked
+# behind something briefly). Outside the window, it's a fresh session.
+REENTRY_WINDOW_SECONDS = 10.0
+
 EMBEDDING_FILE = "embeddings_store.pkl"
 
 # ---- NEW: gallery settings ----
@@ -119,8 +126,20 @@ def update_gallery(store, gid, emb):
         if len(gallery) > GALLERY_SIZE:
             gallery.pop(0)
 
+# ================= RE-ENTRY CLASSIFICATION (NEW) =================
+def check_reentry(recently_lost, gid):
+    """
+    If gid was recently lost (within REENTRY_WINDOW_SECONDS), remove it
+    from recently_lost and return True (continuous re-entry).
+    Otherwise return False (fresh appearance / no recent record).
+    """
+    lost_at = recently_lost.pop(gid, None)
+    if lost_at is None:
+        return False
+    return (time.time() - lost_at) <= REENTRY_WINDOW_SECONDS
+
 # ================= CAMERA PROCESS =================
-def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
+def process_camera(frame, tracks, potentials, models, is_entry, stable_frames, recently_lost):
     global next_gid
 
     active = set()
@@ -173,14 +192,15 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
                 if gid is not None:
                     update_gallery(persistent_store, gid, final_emb)
                     save_store(persistent_store)
-                    tracks[gid] = {"bbox": box, "last_seen": time.time()}
+                    reentry = check_reentry(recently_lost, gid)  # NEW
+                    tracks[gid] = {"bbox": box, "last_seen": time.time(), "reentry": reentry}
                     active.add(gid)
                 else:
                     gid = next_gid
                     next_gid += 1
                     persistent_store[gid] = [final_emb]  # gallery starts with 1 entry
                     save_store(persistent_store)
-                    tracks[gid] = {"bbox": box, "last_seen": time.time()}
+                    tracks[gid] = {"bbox": box, "last_seen": time.time(), "reentry": False}
                     active.add(gid)
 
         else:
@@ -188,7 +208,8 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
             gid, _ = best_gallery_match(emb, persistent_store, SECONDARY_THRESHOLD)
             if gid is not None:
                 update_gallery(persistent_store, gid, emb)
-                tracks[gid] = {"bbox": box, "last_seen": time.time()}
+                reentry = check_reentry(recently_lost, gid)  # NEW
+                tracks[gid] = {"bbox": box, "last_seen": time.time(), "reentry": reentry}
                 active.add(gid)
 
     # CHANGED: expire tracks based on elapsed time since last_seen,
@@ -198,7 +219,15 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames):
     for tid in list(tracks.keys()):
         if tid not in active:
             if now - tracks[tid]["last_seen"] > MAX_MISSING_SECONDS:
+                recently_lost[tid] = now  # NEW: remember when this identity was lost
                 del tracks[tid]
+
+    # NEW: prune recently_lost entries older than the re-entry window,
+    # otherwise this dict grows forever and stale entries could wrongly
+    # be classified as a "re-entry" far later.
+    for tid in list(recently_lost.keys()):
+        if now - recently_lost[tid] > REENTRY_WINDOW_SECONDS:
+            del recently_lost[tid]
 
 # ================= CAMERA WORKER (NEW) =================
 class CameraWorker:
@@ -214,6 +243,7 @@ class CameraWorker:
         self.cap = cv2.VideoCapture(config["source"])
         self.tracks = {}
         self.potentials = {} if self.is_entry else None
+        self.recently_lost = {}  # NEW: gid -> timestamp when it was lost
         self.stable_frames = stable_frames
 
     def step(self, models):
@@ -223,7 +253,8 @@ class CameraWorker:
         process_camera(
             frame, self.tracks,
             self.potentials if self.is_entry else {},
-            models, self.is_entry, self.stable_frames
+            models, self.is_entry, self.stable_frames,
+            self.recently_lost  # NEW
         )
         for gid, t in self.tracks.items():
             x, y, w, h = t["bbox"]
