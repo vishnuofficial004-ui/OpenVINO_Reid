@@ -7,38 +7,21 @@ import json
 from openvino.runtime import Core
 
 # ================= CONFIG =================
-STABLE_SECONDS = 1.5
+STABLE_SECONDS = 1.5       # how long a face must stay put before we try to identify it
 IOU_THRESHOLD = 0.3
 ENTRY_THRESHOLD = 0.80
 SECONDARY_THRESHOLD = 0.72
-MAX_MISSING_SECONDS = 3.0  # CHANGED: was MAX_MISSING = 5 (frame count)
-
-# ---- NEW: re-entry window ----
-# When a track expires, we don't just forget it — we remember it was
-# "recently lost" for a short window. If the same identity is matched
-# again within that window, it's a continuous re-entry (e.g. walked
-# behind something briefly). Outside the window, it's a fresh session.
-REENTRY_WINDOW_SECONDS = 10.0
+MAX_MISSING_SECONDS = 3.0      # drop a track if unseen for this long
+REENTRY_WINDOW_SECONDS = 10.0  # how long a lost identity counts as "still nearby"
+MATCH_MARGIN = 0.05            # min score gap needed to accept a match over the runner-up
 
 EMBEDDING_FILE = "embeddings_store.pkl"
+GALLERY_SIZE = 5               # max embeddings kept per identity
+GALLERY_ADD_THRESHOLD = 0.85   # only add to gallery if sufficiently different from existing entries
 
-# ---- NEW: gallery settings ----
-# Instead of storing ONE averaged embedding per identity, we keep a small
-# rolling set of embeddings ("gallery") captured at different times/angles.
-# Matching checks similarity against the whole gallery, not one vector,
-# which is far more robust over long sessions.
-GALLERY_SIZE = 5          # max embeddings kept per identity
-GALLERY_ADD_THRESHOLD = 0.85  # only add a new embedding if it's "different enough"
-
-# ---- NEW: list of cameras instead of 2 hardcoded ones ----
-# Each camera config declares its own source and whether it acts
-# as an "entry" camera (i.e. allowed to REGISTER new identities)
-# or a "secondary" camera (can only MATCH against existing ones).
 CAMERAS = [
-    {"name": "MOBILE_ENTRY", "source": "http://192.168.1.5:8080/video", "is_entry": True},
-    {"name": "PC_SECONDARY",  "source": 0,                               "is_entry": False},
-    # Add more cameras here, e.g.:
-    # {"name": "HALLWAY_CAM", "source": "rtsp://192.168.1.20/stream", "is_entry": False},
+    {"name": "MOBILE_ENTRY", "source": "http://192.168.1.5:8080/video", "is_entry": True},   # entry cams register new identities
+    {"name": "PC_SECONDARY",  "source": 0,                               "is_entry": False},  # secondary cams only match existing ones
 ]
 
 # ================= STORAGE =================
@@ -55,21 +38,9 @@ def save_store(store):
 persistent_store = load_store()
 next_gid = max(persistent_store.keys(), default=-1) + 1
 
-# ---- NEW: event log ----
-# Central record of everything that happens to an identity across
-# cameras. Not written to yet — Step 4b/4c/4d will call log_event()
-# for registration, match, and loss events respectively. This log is
-# what Step 4e will use to compute an actual continuity percentage.
-event_log = []
+event_log = []  # record of register/match/lost events, used for the continuity metric
 
 def log_event(event_type, gid, camera_name, extra=None):
-    """
-    Append a single event to the event log.
-    event_type: e.g. "registered", "matched", "lost"
-    gid: identity id involved
-    camera_name: which camera this happened on
-    extra: optional dict of additional info (e.g. {"reentry": True})
-    """
     event_log.append({
         "timestamp": time.time(),
         "event": event_type,
@@ -78,26 +49,13 @@ def log_event(event_type, gid, camera_name, extra=None):
         "extra": extra or {},
     })
 
-# ================= CONTINUITY METRIC (NEW) =================
 def compute_continuity(log):
-    """
-    Computes identity continuity %: of all times an identity was lost,
-    what fraction were successfully reconnected (a later "matched"
-    event with reentry=True) rather than permanently lost.
-
-    Returns a dict: {
-        "total_losses": int,
-        "reconnected": int,
-        "continuity_pct": float
-    }
-    """
+    # % of losses that were later reconnected via a re-entry match
     lost_events = [e for e in log if e["event"] == "lost"]
     matched_events = [e for e in log if e["event"] == "matched"]
 
     reconnected = 0
     for lost in lost_events:
-        # was there a later "matched" event for the same identity,
-        # marked as a reentry, after this loss?
         found = any(
             m["gid"] == lost["gid"]
             and m["timestamp"] > lost["timestamp"]
@@ -116,13 +74,8 @@ def compute_continuity(log):
         "continuity_pct": round(pct, 2),
     }
 
-# ================= GROUND TRUTH LOADING (NEW, Step 5a) =================
 def load_ground_truth(path):
-    """
-    Load and validate a ground-truth test set file (see ground_truth_schema.md).
-    Only checks the file is well-formed here — Step 5b will actually replay
-    the clips and Step 5c will compare pipeline output against this data.
-    """
+    # validates schema only, replay/comparison happens elsewhere
     with open(path, "r") as f:
         data = json.load(f)
 
@@ -194,39 +147,36 @@ def aggregate_embeddings(embs):
     emb = np.mean(good, axis=0)
     return emb / np.linalg.norm(emb)
 
-# ================= GALLERY MATCHING (NEW) =================
 def best_gallery_match(emb, store, threshold):
-    """
-    Compare emb against every identity's gallery (list of embeddings)
-    and return (gid, score) for the best match above threshold, else
-    (None, 0). This replaces comparing against a single stored vector.
-    """
-    best_gid, best_score = None, 0.0
+    # returns (gid, score); refuses to match if top two candidates are too close
+    scores = []
     for gid, gallery in store.items():
         score = max(cosine(emb, g) for g in gallery)
-        if score > threshold and score > best_score:
-            best_gid, best_score = gid, score
+        if score > threshold:
+            scores.append((gid, score))
+
+    if not scores:
+        return None, 0.0
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    best_gid, best_score = scores[0]
+
+    if len(scores) > 1:
+        second_score = scores[1][1]
+        if (best_score - second_score) < MATCH_MARGIN:
+            return None, 0.0
+
     return best_gid, best_score
 
 def update_gallery(store, gid, emb):
-    """
-    Add emb to gid's gallery if it's sufficiently different from what's
-    already stored (avoids saving near-duplicate frames), and cap the
-    gallery at GALLERY_SIZE by dropping the oldest entry.
-    """
     gallery = store[gid]
     if max(cosine(emb, g) for g in gallery) < GALLERY_ADD_THRESHOLD:
         gallery.append(emb)
         if len(gallery) > GALLERY_SIZE:
             gallery.pop(0)
 
-# ================= RE-ENTRY CLASSIFICATION (NEW) =================
 def check_reentry(recently_lost, gid):
-    """
-    If gid was recently lost (within REENTRY_WINDOW_SECONDS), remove it
-    from recently_lost and return True (continuous re-entry).
-    Otherwise return False (fresh appearance / no recent record).
-    """
+    # pops gid so it can't be reused for a second match
     lost_at = recently_lost.pop(gid, None)
     if lost_at is None:
         return False
@@ -280,61 +230,47 @@ def process_camera(frame, tracks, potentials, models, is_entry, stable_frames, r
                 final_emb = aggregate_embeddings(p["embs"])
                 del potentials[pid]
 
-                # NEW: match against each identity's gallery, not one vector
                 gid, _ = best_gallery_match(final_emb, persistent_store, ENTRY_THRESHOLD)
 
                 if gid is not None:
                     update_gallery(persistent_store, gid, final_emb)
                     save_store(persistent_store)
-                    reentry = check_reentry(recently_lost, gid)  # NEW
+                    reentry = check_reentry(recently_lost, gid)
                     tracks[gid] = {"bbox": box, "last_seen": time.time(), "reentry": reentry}
                     active.add(gid)
-                    log_event("matched", gid, camera_name, {"reentry": reentry})  # NEW
+                    log_event("matched", gid, camera_name, {"reentry": reentry})
                 else:
                     gid = next_gid
                     next_gid += 1
-                    persistent_store[gid] = [final_emb]  # gallery starts with 1 entry
+                    persistent_store[gid] = [final_emb]
                     save_store(persistent_store)
                     tracks[gid] = {"bbox": box, "last_seen": time.time(), "reentry": False}
                     active.add(gid)
-                    log_event("registered", gid, camera_name)  # NEW
+                    log_event("registered", gid, camera_name)
 
         else:
-            # NEW: match against gallery instead of single stored vector
             gid, _ = best_gallery_match(emb, persistent_store, SECONDARY_THRESHOLD)
             if gid is not None:
                 update_gallery(persistent_store, gid, emb)
-                reentry = check_reentry(recently_lost, gid)  # NEW
+                reentry = check_reentry(recently_lost, gid)
                 tracks[gid] = {"bbox": box, "last_seen": time.time(), "reentry": reentry}
                 active.add(gid)
-                log_event("matched", gid, camera_name, {"reentry": reentry})  # NEW
+                log_event("matched", gid, camera_name, {"reentry": reentry})
 
-    # CHANGED: expire tracks based on elapsed time since last_seen,
-    # not a frame-count "miss" counter. This behaves consistently
-    # regardless of each camera's FPS.
     now = time.time()
     for tid in list(tracks.keys()):
         if tid not in active:
             if now - tracks[tid]["last_seen"] > MAX_MISSING_SECONDS:
-                recently_lost[tid] = now  # NEW: remember when this identity was lost
-                log_event("lost", tid, camera_name)  # NEW
+                recently_lost[tid] = now
+                log_event("lost", tid, camera_name)
                 del tracks[tid]
 
-    # NEW: prune recently_lost entries older than the re-entry window,
-    # otherwise this dict grows forever and stale entries could wrongly
-    # be classified as a "re-entry" far later.
     for tid in list(recently_lost.keys()):
         if now - recently_lost[tid] > REENTRY_WINDOW_SECONDS:
             del recently_lost[tid]
 
-# ================= CAMERA WORKER (NEW) =================
+# ================= CAMERA WORKER =================
 class CameraWorker:
-    """
-    NEW: wraps a single camera's capture handle, its own tracks dict,
-    and (if it's an entry camera) its own potentials dict.
-    Lets main() loop over an arbitrary list of cameras instead of
-    hardcoding two separate blocks of near-duplicate code.
-    """
     def __init__(self, config, stable_frames):
         self.name = config["name"]
         self.is_entry = config["is_entry"]
@@ -342,12 +278,6 @@ class CameraWorker:
         self.tracks = {}
         self.potentials = {} if self.is_entry else None
         self.stable_frames = stable_frames
-        # CHANGED: recently_lost is no longer owned per-camera. A single
-        # shared dict (passed in from main()) is used by all cameras, so
-        # an identity lost on one camera can be recognized as a re-entry
-        # when matched on a DIFFERENT camera. This was previously broken:
-        # each camera had its own recently_lost, so cross-camera re-entry
-        # was never detected — only same-camera re-entry was.
 
     def step(self, models, recently_lost):
         ret, frame = self.cap.read()
@@ -357,7 +287,7 @@ class CameraWorker:
             frame, self.tracks,
             self.potentials if self.is_entry else {},
             models, self.is_entry, self.stable_frames,
-            recently_lost, self.name  # CHANGED: shared dict passed in per call
+            recently_lost, self.name
         )
         for gid, t in self.tracks.items():
             x, y, w, h = t["bbox"]
@@ -374,16 +304,13 @@ class CameraWorker:
 def main():
     models = load_models()
 
-    # NEW: build a worker per camera in CAMERAS instead of two fixed captures
     probe_fps_cap = cv2.VideoCapture(CAMERAS[0]["source"])
     fps = probe_fps_cap.get(cv2.CAP_PROP_FPS)
     probe_fps_cap.release()
     stable_frames = int((fps if fps > 0 else 10) * STABLE_SECONDS)
 
     workers = [CameraWorker(cfg, stable_frames) for cfg in CAMERAS]
-
-    # CHANGED: shared across all cameras, not one per camera (see CameraWorker note)
-    shared_recently_lost = {}
+    shared_recently_lost = {}  # shared across cameras so cross-camera re-entry is detected
 
     while True:
         for w in workers:
@@ -398,7 +325,6 @@ def main():
         w.release()
     cv2.destroyAllWindows()
 
-    # NEW: report identity continuity from the session's event log
     stats = compute_continuity(event_log)
     print(f"Identity continuity: {stats['reconnected']}/{stats['total_losses']} "
           f"reconnected ({stats['continuity_pct']}%)")
