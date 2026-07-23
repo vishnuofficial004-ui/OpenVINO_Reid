@@ -3,6 +3,7 @@ import numpy as np
 import pickle
 import os
 import time
+import json
 from openvino.runtime import Core
 
 # ================= CONFIG =================
@@ -114,6 +115,38 @@ def compute_continuity(log):
         "reconnected": reconnected,
         "continuity_pct": round(pct, 2),
     }
+
+# ================= GROUND TRUTH LOADING (NEW, Step 5a) =================
+def load_ground_truth(path):
+    """
+    Load and validate a ground-truth test set file (see ground_truth_schema.md).
+    Only checks the file is well-formed here — Step 5b will actually replay
+    the clips and Step 5c will compare pipeline output against this data.
+    """
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    if "clips" not in data or "crossings" not in data:
+        raise ValueError("ground truth file must have 'clips' and 'crossings' keys")
+
+    clip_ids = set()
+    for clip in data["clips"]:
+        for key in ("clip_id", "camera", "video_path", "identities"):
+            if key not in clip:
+                raise ValueError(f"clip missing required field: {key}")
+        clip_ids.add(clip["clip_id"])
+
+    for crossing in data["crossings"]:
+        for key in ("person_label", "from_clip", "to_clip", "expected_same_identity"):
+            if key not in crossing:
+                raise ValueError(f"crossing missing required field: {key}")
+        if crossing["from_clip"] not in clip_ids or crossing["to_clip"] not in clip_ids:
+            raise ValueError(
+                f"crossing references unknown clip_id: "
+                f"{crossing['from_clip']} or {crossing['to_clip']}"
+            )
+
+    return data
 
 # ================= MODELS =================
 def load_models():
@@ -308,10 +341,15 @@ class CameraWorker:
         self.cap = cv2.VideoCapture(config["source"])
         self.tracks = {}
         self.potentials = {} if self.is_entry else None
-        self.recently_lost = {}  # NEW: gid -> timestamp when it was lost
         self.stable_frames = stable_frames
+        # CHANGED: recently_lost is no longer owned per-camera. A single
+        # shared dict (passed in from main()) is used by all cameras, so
+        # an identity lost on one camera can be recognized as a re-entry
+        # when matched on a DIFFERENT camera. This was previously broken:
+        # each camera had its own recently_lost, so cross-camera re-entry
+        # was never detected — only same-camera re-entry was.
 
-    def step(self, models):
+    def step(self, models, recently_lost):
         ret, frame = self.cap.read()
         if not ret:
             return None
@@ -319,7 +357,7 @@ class CameraWorker:
             frame, self.tracks,
             self.potentials if self.is_entry else {},
             models, self.is_entry, self.stable_frames,
-            self.recently_lost, self.name  # NEW: pass camera_name
+            recently_lost, self.name  # CHANGED: shared dict passed in per call
         )
         for gid, t in self.tracks.items():
             x, y, w, h = t["bbox"]
@@ -344,9 +382,12 @@ def main():
 
     workers = [CameraWorker(cfg, stable_frames) for cfg in CAMERAS]
 
+    # CHANGED: shared across all cameras, not one per camera (see CameraWorker note)
+    shared_recently_lost = {}
+
     while True:
         for w in workers:
-            frame = w.step(models)
+            frame = w.step(models, shared_recently_lost)
             if frame is not None:
                 cv2.imshow(w.name, frame)
 
