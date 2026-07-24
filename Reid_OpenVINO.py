@@ -22,6 +22,7 @@ GALLERY_ADD_THRESHOLD = 0.85   # only add to gallery if sufficiently different f
 CAMERAS = [
     {"name": "MOBILE_ENTRY", "source": "http://192.168.1.5:8080/video", "is_entry": True},   # entry cams register new identities
     {"name": "PC_SECONDARY",  "source": 0,                               "is_entry": False},  # secondary cams only match existing ones
+    {"name": "HALLWAY_CAM",   "source": "rtsp://192.168.1.20/stream",    "is_entry": False},  # third camera, confirms N-camera scale
 ]
 
 # ================= STORAGE =================
