@@ -81,4 +81,4 @@ The gallery approach instead keeps a handful of distinct real embeddings per per
 
 ## License
 
-MIT (or whatever you'd like — this is a personal/learning project).
+MIT (This is a learning project).
